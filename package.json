@@ -1,0 +1,29 @@
+{
+  "name": "htmax",
+  "private": true,
+  "sideEffects": false,
+  "version": "0.0.0",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./router": {
+      "import": "./dist/router.js",
+      "types": "./dist/router.d.ts"
+    }
+  },
+  "devDependencies": {
+    "@oakserver/oak": "^12.6.1",
+    "@playwright/test": "1.37.x",
+    "@types/node": "^20.8.3",
+    "prettier": "^3.0.3",
+    "tsup": "^7.2.0",
+    "typescript": "^5.0.2",
+    "typescript-language-server": "^3.3.2"
+  }
+}
