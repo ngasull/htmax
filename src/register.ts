@@ -1,3 +1,5 @@
-import { register } from "./router";
+import { register as action } from "./action.ts";
+import { register as router } from "./router.ts";
 
-register();
+action();
+router();

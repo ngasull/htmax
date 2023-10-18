@@ -1,5 +1,28 @@
 /// <reference path="./importMeta.d.ts" />
 
+import {
+  Promise,
+  body,
+  call,
+  dataset,
+  dispatchPrevented,
+  doMatch,
+  doc,
+  forEach,
+  head,
+  newURL,
+  parseHtml,
+  preventDefault,
+  querySelector,
+  querySelectorAll,
+  replaceWith,
+  routeFormEvent,
+  routeLoadEvent,
+  startsWith,
+  subEvent,
+  submit,
+} from "./util.ts";
+
 declare global {
   interface Window {
     __htmax?: (() => void)[];
@@ -9,135 +32,119 @@ declare global {
 const suspenseDelay = 500;
 const routeAttr = "route";
 const dataRoute = `data-${routeAttr}`;
-const routeFromParam = "_routefrom";
+const routeIndexParam = "_index";
+const routeLayoutParam = "_layout";
 
-const doc = document;
+let routeRequests: Record<string, Promise<Document> | 0 | undefined> = {};
 
-let routeRequests: Record<string, undefined | 0 | Promise<unknown>> = {};
-
-const findObsoleteRoute = (
+const findObsolete = (
   url: string,
   parent?: HTMLElement,
   path = "",
-): [string, HTMLElement] | null => {
-  let routeEl = (parent || doc).querySelector<HTMLElement>(`[${dataRoute}]`),
-    subPath = routeEl ? path + routeEl.dataset[routeAttr] : path;
-  return parent
-    ? routeEl
-      ? url.startsWith(subPath)
-        ? findObsoleteRoute(url, routeEl, subPath)
-        : subPath.startsWith(url)
-        ? [subPath.slice(0, url.length), routeEl]
-        : [subPath, parent]
-      : [path, parent]
-    : routeEl && findObsoleteRoute(url, routeEl, subPath);
+): [string[], HTMLElement] | null => {
+  let routeEl = querySelector<HTMLElement>(`[${dataRoute}]`, parent),
+    subPath = routeEl ? path + dataset(routeEl)[routeAttr] : path;
+  return routeEl
+    ? startsWith(url, subPath)
+      ? findObsolete(url, routeEl, subPath)
+      : [
+          startsWith(subPath, url)
+            ? // Only index needed
+              [url]
+            : // Subpaths starting from `path`
+              url
+                .slice(path.length)
+                .split("/")
+                .map((_, i, arr) => path + arr.slice(0, i + 1).join("/")),
+          routeEl,
+        ]
+    : parent
+    ? [[url], parent] // No layout to replace; parent is the page to replace
+    : routeEl;
 };
 
-const currentUrl = () => location.pathname + location.search;
-
-const handleLocationChange = () => {
-  let url = currentUrl(),
-    fromRoute = findObsoleteRoute(url);
+const handleLocationChange = async () => {
+  let { pathname, search } = location,
+    obsolete = findObsolete(pathname);
 
   // Fallback to regular navigation if page defines no route
-  if (!fromRoute) return location.replace(url);
+  if (!obsolete) return location.replace(pathname + search);
 
-  let [fromPath, slot] = fromRoute,
+  let [missingPartials, slot] = obsolete,
     curSlot = slot as HTMLElement | null | undefined,
-    search = new URLSearchParams(location.search),
-    q: Promise<unknown>,
-    streamQ: Promise<unknown>,
-    action,
-    actions: null | ((slot: HTMLElement) => HTMLElement | null | undefined)[] =
-      [];
+    searchParams = new URLSearchParams(search),
+    resEls: Promise<Document>[],
+    el: Document;
 
-  search.append(routeFromParam, fromPath);
+  searchParams.append(routeIndexParam, "");
 
-  q = routeRequests[url] ||= fetch(`${url}?${search}`)
-    .then(async (res) => {
-      await (res.redirected
-        ? Promise.reject(navigate(res.url))
-        : Promise.race([
-            (streamQ = (async () => {
-              for await (action of responseActions(url, res.body!)) {
-                if (actions) {
-                  actions.push(action);
-                } else if (!curSlot || !(curSlot = action(curSlot))) {
-                  break;
-                }
-              }
-              return 1;
-            })()),
-            new Promise<undefined>((resolve) =>
-              setTimeout(resolve, suspenseDelay),
-            ),
-          ]));
+  await Promise.race([
+    new Promise<undefined>((resolve) => setTimeout(resolve, suspenseDelay)),
+    Promise.all(
+      (resEls = missingPartials.map(
+        (url, i, q: any) =>
+          (routeRequests[url] ||= q =
+            fetch(
+              `${url}?${
+                i == missingPartials.length - 1
+                  ? searchParams
+                  : routeLayoutParam
+              }`,
+            )
+              .then((res) =>
+                res.redirected ? Promise.reject(navigate(res.url)) : res.text(),
+              )
+              .then((html) =>
+                q == routeRequests[url] ? parseHtml(html) : Promise.reject(),
+              )
+              .finally(() => (routeRequests[url] = 0))),
+      )),
+    ),
+  ]);
 
-      for (action of actions!)
-        if (q == routeRequests[url] && curSlot) curSlot = action(curSlot);
-      actions = 0 as unknown as null;
+  for await (el of resEls) {
+    if (!(curSlot = processHtmlRoute(el, curSlot!))) break;
+  }
 
-      await streamQ;
-
-      slot.dispatchEvent(new Event("route-load", { bubbles: true }));
-    })
-    .finally(() => (routeRequests[url] = 0));
+  dispatchPrevented(slot, routeLoadEvent);
 };
 
-async function* responseActions(url: string, body: ReadableStream<Uint8Array>) {
-  let decoder = new TextDecoder(),
-    reader = body.getReader(),
-    len = 0,
-    lenLen: number,
-    match,
-    html = "",
-    r;
-
-  while (!(r = await reader.read()).done) {
-    if (currentUrl() != url) return;
-    html += decoder.decode(r.value);
-
-    while ((match = html.match(/^(\d*[1-9])[^0-9]/))) {
-      len = parseInt(match[1]);
-      lenLen = match[1].length;
-
-      if (html.length < len + lenLen) break;
-
-      yield processHtmlRoute(html.slice(lenLen, lenLen + len));
-      html = html.slice(lenLen + len);
-    }
-  }
-  if (html) yield processHtmlRoute(html);
-}
-
-const dom = new DOMParser();
-
-const processHtmlRoute = (html: string) => (slot: HTMLElement) => {
-  let receivedEl;
-  for (receivedEl of doc.importNode<HTMLElement>(
-    dom.parseFromString(html, "text/html").body,
-    true,
-  ).children as HTMLCollectionOf<HTMLElement>) {
-    if (receivedEl.tagName == "HEAD") {
-      for (receivedEl of receivedEl.children as HTMLCollectionOf<HTMLElement>) {
-        switch (receivedEl.tagName) {
-          case "TITLE":
-            doc.title = receivedEl.textContent!;
-            break;
-          default:
-            doc.head.append(receivedEl);
-        }
+const processHtmlRoute = (receivedDoc: Document, slot: HTMLElement) => {
+  let handleResource =
+    <A extends string>(el: HTMLElement & Record<A, string>, srcAttr: A) =>
+    (tagName: string, src?: string) => {
+      if (
+        (src = el[srcAttr]) &&
+        !querySelector(`${tagName}[${srcAttr}="${src}"]`, head)
+      ) {
+        head.append(el);
       }
-    } else {
-      slot.replaceWith(receivedEl);
-      return receivedEl.querySelector<HTMLElement>(`[${dataRoute}]`);
-    }
-  }
+    };
+
+  forEach(
+    querySelectorAll<HTMLTemplateElement>(`template[data-head]`, receivedDoc),
+    (headEl) => {
+      forEach(headEl.content.children, (el) =>
+        doMatch(el.tagName, {
+          TITLE() {
+            doc.title = (el as HTMLTitleElement).text;
+          },
+          LINK: handleResource(el as HTMLLinkElement, "href"),
+          SCRIPT: handleResource(el as HTMLScriptElement, "src"),
+        }),
+      );
+      headEl.remove();
+    },
+  );
+
+  replaceWith(slot, receivedDoc.body.children[0]);
+
+  return querySelector<HTMLElement>(`[${dataRoute}]`, receivedDoc);
 };
 
 export const navigate = (path: string) => {
   let origin = location.origin,
-    url = new URL(path, origin),
+    url = newURL(path, origin),
     navigated = url.origin == origin;
   if (navigated) {
     history.pushState(0, "", url);
@@ -146,60 +153,31 @@ export const navigate = (path: string) => {
   return navigated;
 };
 
-type ListenerOfAddEvent<
-  T extends EventTarget | Window,
-  K extends keyof HTMLElementEventMap | keyof WindowEventMap,
-> = (
-  this: T,
-  e: T extends Window
-    ? K extends keyof WindowEventMap
-      ? WindowEventMap[K]
-      : never
-    : K extends keyof HTMLElementEventMap
-    ? HTMLElementEventMap[K]
-    : never,
-) => void;
+export const register = (root = body) => {
+  let t: EventTarget | null;
 
-const subEvent = <
-  K extends keyof HTMLElementEventMap | keyof WindowEventMap,
-  T extends (EventTarget | Window) & {
-    addEventListener(type: K, listener: ListenerOfAddEvent<T, K>): void;
-    removeEventListener(type: K, listener: ListenerOfAddEvent<T, K>): void;
-  },
->(
-  target: T,
-  type: K,
-  listener: ListenerOfAddEvent<T, K>,
-) => {
-  target.addEventListener(type, listener);
-  return () => target.removeEventListener(type, listener);
-};
-
-export const register = (root = doc.body) => {
   window.__htmax ??= [
-    subEvent(root, "click", (e) => {
-      let a = e.target;
-      if (
+    subEvent(
+      root,
+      "click",
+      (e) =>
         !e.ctrlKey &&
         !e.shiftKey &&
-        a instanceof HTMLAnchorElement &&
-        navigate(a.href)
-      ) {
-        e.preventDefault();
-      }
-    }),
+        (t = e.target) instanceof HTMLAnchorElement &&
+        navigate(t.href) &&
+        preventDefault(e),
+    ),
 
-    subEvent(root, "submit", (e) => {
-      let f = e.target;
-      if (
-        f instanceof HTMLFormElement &&
-        f.action &&
-        f.method == "get" &&
-        navigate(f.action)
-      ) {
-        e.preventDefault();
-      }
-    }),
+    subEvent(
+      root,
+      submit,
+      (e) =>
+        (t = e.target) instanceof HTMLFormElement &&
+        t.method == "get" &&
+        !dispatchPrevented(t, routeFormEvent) &&
+        navigate(t.action) &&
+        preventDefault(e),
+    ),
 
     subEvent(window, "popstate", handleLocationChange),
   ];
@@ -207,6 +185,6 @@ export const register = (root = doc.body) => {
 
 export const unregister = () => {
   routeRequests = {};
-  window.__htmax?.map((cleanup) => cleanup());
+  window.__htmax?.map(call);
   delete window.__htmax;
 };
