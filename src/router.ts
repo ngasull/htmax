@@ -1,14 +1,17 @@
 /// <reference path="./importMeta.d.ts" />
 
+import { lifecycleTrackChildren, lifecycleUntrack } from "./lifecycle.ts";
 import {
   Promise,
-  body,
+  adoptNode,
   call,
+  customEvent,
   dataset,
   dispatchPrevented,
   doMatch,
   doc,
   forEach,
+  forOf,
   head,
   newURL,
   parseHtml,
@@ -21,6 +24,7 @@ import {
   startsWith,
   subEvent,
   submit,
+  win,
 } from "./util.ts";
 
 declare global {
@@ -106,25 +110,26 @@ const handleLocationChange = async () => {
     if (!(curSlot = processHtmlRoute(el, curSlot!))) break;
   }
 
-  dispatchPrevented(slot, routeLoadEvent);
+  dispatchPrevented(slot, customEvent(routeLoadEvent));
 };
 
 const processHtmlRoute = (receivedDoc: Document, slot: HTMLElement) => {
   let handleResource =
-    <A extends string>(el: HTMLElement & Record<A, string>, srcAttr: A) =>
-    (tagName: string, src?: string) => {
-      if (
-        (src = el[srcAttr]) &&
-        !querySelector(`${tagName}[${srcAttr}="${src}"]`, head)
-      ) {
-        head.append(el);
-      }
-    };
+      <A extends string>(el: HTMLElement & Record<A, string>, srcAttr: A) =>
+      (tagName: string, src?: string) => {
+        if (
+          (src = el[srcAttr]) &&
+          !querySelector(`${tagName}[${srcAttr}="${src}"]`, head)
+        ) {
+          head.append(adoptNode(el));
+        }
+      },
+    content = adoptNode(receivedDoc.body.children[0]);
 
   forEach(
     querySelectorAll<HTMLTemplateElement>(`template[data-head]`, receivedDoc),
     (headEl) => {
-      forEach(headEl.content.children, (el) =>
+      forOf(headEl.content.children, (el) =>
         doMatch(el.tagName, {
           TITLE() {
             doc.title = (el as HTMLTitleElement).text;
@@ -137,9 +142,11 @@ const processHtmlRoute = (receivedDoc: Document, slot: HTMLElement) => {
     },
   );
 
-  replaceWith(slot, receivedDoc.body.children[0]);
+  lifecycleUntrack(slot);
+  replaceWith(slot, content);
+  lifecycleTrackChildren(content);
 
-  return querySelector<HTMLElement>(`[${dataRoute}]`, receivedDoc);
+  return querySelector<HTMLElement>(`[${dataRoute}]`, content);
 };
 
 export const navigate = (path: string) => {
@@ -153,10 +160,10 @@ export const navigate = (path: string) => {
   return navigated;
 };
 
-export const register = (root = body) => {
+export const register = (root = doc.body) => {
   let t: EventTarget | null;
 
-  window.__htmax ??= [
+  win.__htmax ??= [
     subEvent(
       root,
       "click",
@@ -174,17 +181,21 @@ export const register = (root = body) => {
       (e) =>
         (t = e.target) instanceof HTMLFormElement &&
         t.method == "get" &&
-        !dispatchPrevented(t, routeFormEvent) &&
+        !dispatchPrevented(t, customEvent(routeFormEvent)) &&
         navigate(t.action) &&
         preventDefault(e),
     ),
 
-    subEvent(window, "popstate", handleLocationChange),
+    subEvent(win, "popstate", handleLocationChange),
+
+    ...[...querySelectorAll(`[${dataRoute}]`)]
+      .map(lifecycleTrackChildren)
+      .reverse(),
   ];
 };
 
 export const unregister = () => {
   routeRequests = {};
-  window.__htmax?.map(call);
-  delete window.__htmax;
+  win.__htmax?.map(call);
+  delete win.__htmax;
 };

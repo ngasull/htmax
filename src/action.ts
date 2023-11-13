@@ -1,5 +1,6 @@
+import { JSONable } from "./jsx/jsx.types.ts";
+import { setResources } from "./lifecycle.ts";
 import {
-  body,
   call,
   cloneNode,
   dataset,
@@ -19,6 +20,10 @@ import {
   assign,
   pushR,
   doc,
+  adoptNode,
+  forEach,
+  forOf,
+  length,
 } from "./util.ts";
 
 declare global {
@@ -32,7 +37,7 @@ const submissions = new WeakMap<HTMLFormElement, Promise<unknown>>();
 const parentForm = (el: HTMLElement | null): HTMLFormElement | null =>
   el instanceof HTMLFormElement ? el : el && parentForm(el.parentElement);
 
-const handleSubmit = (e: SubmitEvent) => {
+const handleSubmitOld = (e: SubmitEvent) => {
   let target = e.target as HTMLElement,
     form = parentForm(target),
     action: string,
@@ -57,7 +62,7 @@ const handleSubmit = (e: SubmitEvent) => {
               addRollback(() => replaceWith(partial, el));
             } else {
               let comment = doc.createComment("");
-              el.replaceWith(comment);
+              replaceWith(el, comment);
               addRollback(() => replaceWith(comment, el));
             }
           }
@@ -95,77 +100,91 @@ const handleSubmit = (e: SubmitEvent) => {
 
     formData = new FormData(form, e.submitter);
 
-    const processTemplate = (
-      node: Node,
-      evaluate: ReturnType<typeof makeEvaluate<string>>,
-      el?: Element,
-    ) => {
-      let nodeType = node.nodeType,
-        processChildren = (
-          el: Element,
-          scopedEvaluate = evaluate,
-          child?: Node,
-        ) => {
-          for (child of el.childNodes) processTemplate(child, scopedEvaluate);
-        };
+    const processChildren = (
+        el: Element,
+        evaluate: ReturnType<typeof makeEvaluate<string>>,
+      ) => processChildNodes([...el.childNodes], evaluate),
+      processChildNodes = (
+        childNodes: Iterable<ChildNode>,
+        evaluate: ReturnType<typeof makeEvaluate<string>>,
+      ) => {
+        let isCaseResolved = 1,
+          unresolve = () => (isCaseResolved = 0),
+          chexecTest = (el: Element, test = el.getAttribute("test")) =>
+            !isCaseResolved && evaluate(test || "0")
+              ? execCase(el)
+              : el.remove(),
+          execCase = (el: Element) => {
+            isCaseResolved = 1;
+            processChildren(el!, evaluate);
+            replaceWith(el!, ...el!.childNodes);
+          },
+          child;
 
-      if ((nodeType = node.nodeType) == 3 /* Node.TEXT_NODE */) {
-        node.textContent = evaluate(node.textContent!);
-      } else if (nodeType == 1 /* Node.ELEMENT_NODE */) {
-        doMatch(
-          (el = node as Element).tagName,
-          {
-            CONDITION$() {
-              for (let matchEl of el!.children) {
-                if (
-                  (matchEl =
-                    doMatch(matchEl.tagName, {
-                      IF$: (_) =>
-                        evaluate(matchEl.getAttribute("test") || "0")
-                          ? matchEl
-                          : (0 as unknown as Element),
-                    }) ?? matchEl)
-                ) {
-                  processChildren(matchEl, evaluate);
-                  el!.replaceWith(...matchEl.childNodes);
-                }
-              }
-            },
-            FOR$() {
-              let item,
-                clone,
-                list: ChildNode[] = [];
-              for (item of evaluate(el!.getAttribute("each") || "[]")) {
-                processChildren(
-                  (clone = cloneNode(el!)),
-                  evaluate.add(el!.getAttribute("var") || "_", item),
-                );
-                pushR(list, ...clone.childNodes);
-              }
-              el!.replaceWith(...list);
-            },
-          },
-          () => {
-            for (let attr of (node as Element).attributes) {
-              attr.value = evaluate(attr.value);
+        for (child of childNodes)
+          processTemplate(child, evaluate, unresolve, chexecTest);
+      },
+      processTemplate = (
+        node: ChildNode,
+        evaluate: ReturnType<typeof makeEvaluate<string>>,
+        unresolve: () => void,
+        chexecTest: (el: Element, test?: string) => void,
+      ) => {
+        let nodeType = node.nodeType;
+
+        if (nodeType == 1 /* Node.ELEMENT_NODE */) {
+          let name,
+            value,
+            match,
+            el = node as Element;
+          for ({ name, value } of el.attributes) {
+            if ((match = name.match(/^js-(.+)$/))) {
+              el.removeAttribute(name);
+              el.setAttribute(match[1], evaluate(value));
             }
-            return processChildren(node as Element);
-          },
-        );
-      }
-      return node;
-    };
+          }
+          doMatch(
+            el.tagName,
+            {
+              "JS-TEXT"() {
+                replaceWith(node, evaluate((el as HTMLElement).innerText));
+              },
+              "JS-IF"() {
+                unresolve();
+                chexecTest(el);
+              },
+              "JS-ELSEIF"() {
+                chexecTest(el);
+              },
+              "JS-ELSE"() {
+                chexecTest(el, "1");
+              },
+              "JS-FOR"() {
+                let item,
+                  clone,
+                  list: ChildNode[] = [];
+                for (item of evaluate(el.getAttribute("each") || "[]")) {
+                  processChildren(
+                    (clone = cloneNode(el)),
+                    evaluate.add(el.getAttribute("var") || "_", item),
+                  );
+                  pushR(list, ...clone.childNodes);
+                }
+                replaceWith(el, ...list);
+              },
+            },
+            () => processChildren(el, evaluate),
+          );
+        }
+      };
     for (let o of querySelectorAll<HTMLTemplateElement>(
       `template[data-optimistic]`,
       form,
     )) {
       for (let oe of o.content.children) {
-        pushR(
-          optimisticPartials,
-          processTemplate(cloneNode(oe), makeEvaluate(formData)) as
-            | HTMLElement
-            | SVGElement,
-        );
+        let clone = cloneNode(oe);
+        processChildNodes([clone], makeEvaluate(formData));
+        pushR(optimisticPartials, clone as HTMLElement | SVGElement);
       }
     }
 
@@ -175,15 +194,20 @@ const handleSubmit = (e: SubmitEvent) => {
         method,
         body: formData,
       })
-        .then(async (res) => {
-          if (!res.headers.get("Content-Type")?.includes(textHtml))
-            throw res.text();
-          updateTargets([...parseHtml(await res.text()).body.children] as (
-            | HTMLElement
-            | SVGElement
-          )[]);
-        })
-        .catch(() => rollbacks.map(call))
+        .then((res) =>
+          !res.ok || !res.headers.get("Content-Type")?.includes(textHtml)
+            ? (rollbacks.map(call), Promise.reject())
+            : res.text(),
+        )
+        .then(
+          (html) => (
+            rollbacks.map(call),
+            updateTargets([...adoptNode(parseHtml(html).body).children] as (
+              | HTMLElement
+              | SVGElement
+            )[])
+          ),
+        )
         .finally(() => submissions.delete(form!)),
     );
 
@@ -196,12 +220,17 @@ const makeEvaluate = <T>(formData: FormData) => {
       new Proxy(formData, {
         get: (formData: FormData, name: string) => formData[get](name),
       }),
-    args = {
-      // ...formData,
-      formData,
-      all: formProxy("getAll"),
-      has: formProxy("has"),
-      raw: formProxy("get"),
+    args: Record<string, unknown> = {
+      ...[...formData.keys()].map((k, vs?: any) => [
+        k,
+        ((vs = formData.getAll(k)), length(vs) > 1 ? vs : vs[0]),
+      ]),
+      form: {
+        data: formData,
+        all: formProxy("getAll"),
+        has: formProxy("has"),
+        raw: formProxy("get"),
+      },
     },
     makeScopable = (dataArgNames: string[], dataArgs: unknown[]) =>
       assign(
@@ -220,10 +249,39 @@ const makeEvaluate = <T>(formData: FormData) => {
   return makeScopable(keys(args), values(args));
 };
 
-export const register = (root = body) => {
+export const submitForm = (
+  e: SubmitEvent,
+  optimisticData:
+    | null
+    | ((formData: FormData) => Record<string, JSONable | undefined>),
+) => {
+  let form = e.currentTarget as HTMLFormElement,
+    formData: FormData,
+    rollback: null | (() => void);
+
+  if (form && (preventDefault(e), !submissions.has(form))) {
+    formData = new FormData(form, e.submitter);
+    submissions.set(
+      form,
+      fetch(newURL(form.action).pathname, {
+        method: form.method,
+        body: formData,
+      })
+        .then((res) =>
+          !res.ok ? (rollback?.(), Promise.reject()) : res.json(),
+        )
+        .then((resources) => (rollback?.(), setResources(resources)))
+        .finally(() => submissions.delete(form!)),
+    );
+
+    rollback = optimisticData && setResources(optimisticData(formData));
+  }
+};
+
+export const register = (root = doc.body) => {
   window.__htmaction ??= [
     subEvent(root, routeFormEvent, preventDefault),
-    subEvent(root, submit, handleSubmit),
+    // subEvent(root, submit, handleSubmit),
   ];
 };
 

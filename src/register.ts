@@ -1,5 +1,10 @@
 import { register as action } from "./action.ts";
 import { register as router } from "./router.ts";
+import { doc, subEvent } from "./util.ts";
 
-action();
-router();
+import "./lifecycle.ts";
+
+subEvent(doc, "DOMContentLoaded", () => {
+  action();
+  router();
+});
