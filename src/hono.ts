@@ -31,12 +31,12 @@ export const setupRoutes = <
         ? Layout
           ? jsx("div", {
               "data-route": "/" + routePath.split("/").pop(),
-              children: jsx(Layout),
+              children: jsx(Layout, null),
             })
           : jsx("progress", { "data-route": "" })
         : Index &&
           (isIndex
-            ? jsx("div", { "data-route": "/", children: jsx(Index) })
+            ? jsx("div", { "data-route": "/", children: jsx(Index, null) })
             : (() => {
                 const segments = routePath.split("/");
                 const layoutPaths = segments.map((_, i) =>
@@ -56,7 +56,7 @@ export const setupRoutes = <
                         children: prev,
                       }),
                     }),
-                  jsx(Index),
+                  jsx(Index, null),
                 );
               })());
 

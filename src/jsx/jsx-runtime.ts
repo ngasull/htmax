@@ -354,12 +354,22 @@ type CreateElement = {
   <Tag extends JSX.IntrinsicTag>(
     tag: Tag,
     props: JSX.IntrinsicElements[Tag],
+  ): JSX.Element;
+
+  <Tag extends JSX.IntrinsicTag>(
+    tag: Tag,
+    props: JSX.IntrinsicElements[Tag],
     ...children: JSX.Children[]
   ): JSX.Element;
 
   <O extends ElementProps>(
     tag: JSX.Component<O>,
-    props: O,
+    props: O & Partial<ChildrenProp>,
+  ): JSX.Element;
+
+  <O extends ElementProps>(
+    tag: JSX.Component<O>,
+    props: O | null | undefined,
     ...children: JSX.Children[]
   ): JSX.Element;
 };
