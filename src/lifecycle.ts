@@ -1,4 +1,3 @@
-import { submitForm } from "./action.ts";
 import { JSONable } from "./jsx/jsx.types.ts";
 import {
   call,
@@ -9,6 +8,7 @@ import {
   first,
   forEach,
   isArray,
+  isFunction,
   stopPropagation,
   subEvent,
   win,
@@ -27,29 +27,33 @@ const untrackEvent = "lf-u";
 
 // Registers a lifecycle-tracking Node
 export const lifecycleTrackChildren = (node: Node) => {
-  let cleanups = new Map<EventTarget, Set<() => void>>(),
+  let nodes = new Map<EventTarget, Set<() => void>>(),
     trackUnsub = subEvent(node, trackEvent, (e) => {
       let t = e.target!,
-        cs = cleanups.get(t);
+        cs = nodes.get(t);
       if (t != node) {
         stopPropagation(e);
-        if (!cs) cleanups.set(t, (cs = new Set()));
+        if (!cs) nodes.set(t, (cs = new Set()));
         cs.add((e as CustomEvent<() => void>).detail);
       }
     }),
     untrackUnsub = subEvent(node, untrackEvent, (e) => {
-      let t = e.target!;
+      let t = e.target!,
+        cleanups = nodes.get(t);
       if (t != node) {
         stopPropagation(e);
-        forEach(cleanups.get(t), call);
-        cleanups.delete(t);
+        if (
+          cleanups?.delete((e as CustomEvent<() => void>).detail) &&
+          cleanups.size < 1
+        )
+          nodes.delete(t);
       }
     }),
     cleanup = () => {
       untrackUnsub();
       trackUnsub();
-      forEach(cleanups, (cs) => forEach(cs, call));
-      cleanups.clear();
+      forEach(nodes, (cleanups) => forEach(cleanups, call));
+      nodes.clear();
     };
 
   lifecycleTrack(node, cleanup);
@@ -118,74 +122,36 @@ export type HydrationResource = [string, JSONable];
 export type Hydration = [number, ...HydrationInfo][];
 
 export type HydrationInfo =
-  | [string, number[]] // [Raw JS, Resources]
+  | [string, 0 | 1, ...number[]] // [Raw JS, isExpression, ...Resources]
   | [Hydration];
 
 const hydrateNode = (node: Node, hydration: Hydration, resources: string[]) =>
-  forEach(hydration, ([childIndex, h1, h2]) => {
+  forEach(hydration, ([childIndex, h1, h2, ...rs]) => {
     let child = node.childNodes[childIndex];
 
     if (isArray(h1)) {
       hydrateNode(child, h1, resources);
     } else {
-      let values = new Proxy(h2 as JSONable[], {
-          get: (_, i) => store[resources[(h2 as number[])[i as any]]]?.[0],
+      let values = new Proxy(rs as JSONable[], {
+          get: (_, i) => store[resources[(rs as number[])[i as any]]]?.[0],
         }),
         res = new Function(
+          "$0",
+          "$1",
           "_$",
-          "node",
-          "listen",
-          "sub",
-          "submit",
-          `return(${h1 as string})`,
+          h2 ? `return(${h1 as string})` : h1,
         )(
-          values,
           child,
-          (type: string, cb: (e: Event) => void, c = child) =>
-            subEvent(c, type, cb),
           (cb: () => void) =>
             subStore(
-              (h2 as number[]).map((i) => resources[i]),
+              (rs as number[]).map((i) => resources[i]),
               cb,
             ),
-          submitForm,
+          values,
         );
 
-      typeof res == "function" && lifecycleTrack(child, res);
+      isFunction(res) && lifecycleTrack(child, res);
     }
-
-    // doMatch(type, {
-    //   [HydrationType.Parent]() {
-    //     hydrateNode(child, h1 as Hydration, resources);
-    //   },
-    //   [HydrationType.Subscribe]() {
-    //     lifecycleTrack(
-    //       child,
-    //       new Function("_$", "node", "listen", "sub", `return ${h1 as string}`)(
-    //         values,
-    //         child,
-    //         (type: string, cb: (e: Event) => void) => subEvent(node, type, cb),
-    //         (cb: () => void) =>
-    //           subStore(
-    //             (h2 as number[]).map((i) => resources[i]),
-    //             cb,
-    //           ),
-    //       ),
-    //     );
-    //   },
-    //   // [HydrationType.Attr]() {
-    //   //   subEffect(h1 as string, h2 as number[], (text) =>
-    //   //     (child as Element).setAttribute(h3 as string, text),
-    //   //   );
-    //   // },
-    //   // [HydrationType.Text]() {
-    //   //   subEffect(
-    //   //     h1 as string,
-    //   //     h2 as number[],
-    //   //     (text) => ((child as Text).textContent = text),
-    //   //   );
-    //   // },
-    // });
   });
 
 lifecycleTrackChildren(doc);
@@ -195,6 +161,6 @@ win.hy = (
   resources: HydrationResource[],
   node = doc.currentScript!.parentNode!,
 ) => {
-  hydrateNode(node, hydration, resources.map(first));
   setResources(resources);
+  hydrateNode(node, hydration, resources.map(first));
 };

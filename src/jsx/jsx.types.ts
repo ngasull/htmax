@@ -1,6 +1,6 @@
 /// <reference path="./dom.types.ts" />
 
-import type { DOMNode } from "./jsx-runtime.ts";
+import type { ParamKeys } from "hono/types";
 
 export const contextSymbol = Symbol("");
 
@@ -12,7 +12,7 @@ declare global {
       [K in keyof DOMElements]: {
         [P in keyof DOMElements[K]]?:
           | DOMElements[K][P]
-          | JSOrResource<DOMElements[K][P]>;
+          | ReactiveJSExpression<DOMElements[K][P]>;
       };
     };
 
@@ -27,22 +27,22 @@ declare global {
       | DOMLiteral
       | null
       | undefined
-      | JSOrResource<DOMLiteral | null | undefined>
+      | ReactiveJSExpression<DOMLiteral | null | undefined>
       | Array<Children>;
 
     type SyncElement =
       | { kind: ElementKind.Comment; element: string }
       | { kind: ElementKind.Component; element: ComponentElement }
       | { kind: ElementKind.Intrinsic; element: IntrinsicElement }
-      | { kind: ElementKind.JS; element: JSOrResource<DOMLiteral> }
-      | { kind: ElementKind.Text; element: DOMLiteral }
-      | { kind: ElementKind.DOM; element: DOMNode };
+      | { kind: ElementKind.JS; element: ReactiveJSExpression<DOMLiteral> }
+      | { kind: ElementKind.Text; element: TextElement }
+      | { kind: ElementKind.HTMLNode; element: HTMLNodeElement };
 
     interface IntrinsicElement {
       tag: IntrinsicTag;
       props: Record<
         string,
-        | JSOrResource<string | number | boolean | null | undefined>
+        | ReactiveJSExpression<string | number | boolean | null>
         | string
         | number
         | boolean
@@ -50,6 +50,16 @@ declare global {
         | undefined
       >;
       children: Fragment;
+    }
+
+    interface TextElement {
+      text: DOMLiteral;
+      ref?: Ref<Text>;
+    }
+
+    interface HTMLNodeElement {
+      html: string;
+      ref?: Ref<Node>;
     }
 
     interface ComponentElement<
@@ -83,33 +93,126 @@ declare global {
 
     type DOMLiteral = string | number;
 
-    type Resource<T extends JSONable> = { uri: string; value: T };
+    type Resource<T extends JSONable> = {
+      uri: string;
+      value: T | Promise<T>;
+    };
     // Front: Map<URI, T>
 
-    type ResourceGroup<T extends Record<string, JSONable>> = ((
-      v: T,
-    ) => Resource<T>) & {
-      pattern: string;
-      each: (values: T[]) => Resources<T>;
+    type JSFn<Args extends readonly unknown[], R> =
+      | PureJSFn<Args, R>
+      | ReactiveJSFn<Args, R>;
+
+    type PureJSFn<Args extends readonly unknown[], R> = ((
+      ...args: {
+        [I in keyof Args]:
+          | PureJSExpression<Args[I]>
+          | (Args[I] extends JSONable ? Args[I] : never)
+          | (Args[I] extends (...args: infer A) => infer R
+              ? JSX.PureJSFn<A, R>
+              : never);
+      }
+    ) => PureJSExpression<R>) & {
+      _args: Args;
+      argsLength: number;
+      body: JS<R>;
+      // eval: (...args: Args) => R;
+    } & symbol; // Blocks regurlar string interpolation
+
+    type RawJS = { rawJS: string; resources: never } & symbol; // Blocks regurlar string interpolation
+    // Front: Map<hash, { module: Promise, deps: hash[] }>
+
+    type JS<T> = PureJSExpression<T> | PureJSStatements<T>;
+
+    type PureJSExpression<T> = RawJS & {
+      _type: T;
+      expression: true;
+      statements?: never;
     };
 
-    type Resources<T extends Record<string, JSONable>> = {
-      group: ResourceGroup<T>;
+    type PureJSStatements<R> = RawJS & {
+      _type: R;
+      expression?: never;
+      statements: true;
+    };
+
+    type ReactiveJS<T> = ReactiveJSExpression<T> | ReactiveJSStatements<T>;
+
+    type ReactiveJSExpression<T> = Omit<PureJSExpression<T>, "resources"> & {
+      resources: Resource<JSONable>[]; // JSReactive expects an array variable `_$` that contains these resources' value
+    };
+
+    type ReactiveJSStatements<R> = Omit<PureJSStatements<R>, "resources"> & {
+      resources: Resource<JSONable>[];
+    };
+
+    type ReactiveJSFn<Args extends readonly unknown[], R> = ((
+      ...args: {
+        [I in keyof Args]:
+          | ReactiveJSExpression<Args[I]>
+          | PureJSExpression<Args[I]>
+          | (Args[I] extends JSONable ? Args[I] : never)
+          | (Args[I] extends (...args: infer A) => infer R
+              ? JSX.PureJSFn<A, R>
+              : never);
+      }
+    ) => ReactiveJSExpression<R>) & {
+      _args: Args;
+      argsLength: number;
+      body: ReactiveJS<R>;
+      // eval: (...args: Args) => Promise<R extends Promise<infer RR> ? RR : R>;
+    } & symbol;
+
+    type ResourceGroup<
+      T extends Record<string, JSONable>,
+      U extends string,
+    > = ((v: ParamKeys<U>) => Resource<T>) & {
+      pattern: U;
+      each: (values: ParamKeys<U>[]) => Resources<T, U>;
+    };
+
+    type Resources<T extends Record<string, JSONable>, U extends string> = {
+      group: ResourceGroup<T, U>;
       values: Resource<T>[];
     };
 
-    type JS<R> = {
-      rawJS: string;
-      resources: Resource<JSONable>[]; // JS expects an array variable `_$` that contains these resources' value
-      eval: () => R;
-    } & symbol; // Blocks regurlar string interpolation
-    // Front: Map<hash, { module: Promise, deps: hash[] }>
-
-    type JSOrResource<R> = R & JSONable extends never
-      ? JS<R>
-      : JS<R> | Resource<R & JSONable>;
+    type Ref<N> =
+      | PureJSFn<[N, SubStore], (() => void) | void>
+      | ReactiveJSFn<[N, SubStore], (() => void) | void>;
   }
 }
+
+export type SubStore = (cb: () => void) => () => void;
+
+// export type SyncResource<T extends JSONable> = {
+//   uri: string;
+//   value: T;
+// };
+
+// export type SyncJS<T> =
+//   | JSX.JS<T>
+//   | (Omit<JSX.ReactiveJS<T>, "resources"> & {
+//       resources: SyncResource<JSONable>[];
+//     });
+
+// export type SyncJSFn<Args extends readonly unknown[], R> = Omit<
+//   JSX.JSFn<Args, R>,
+//   "body"
+// > & {
+//   body: SyncJS<R>;
+// };
+
+export type SyncRef<N> = {
+  fn:
+    | JSX.PureJSFn<[N, SubStore], (() => void) | void>
+    | JSX.ReactiveJSFn<[N, SubStore], (() => void) | void>;
+  values: JSONable[];
+};
+
+// export type SyncJSReactive<T> = {
+//   fn: JSX.JSFn<[T | undefined, ...JSONable[]], T>;
+//   resources: SyncResource<JSONable>[];
+// };
 
 export enum ElementKind {
   Comment,
@@ -117,15 +220,53 @@ export enum ElementKind {
   Intrinsic,
   JS,
   Text,
-  DOM,
+  HTMLNode,
 }
+
+export enum DOMNodeKind {
+  Tag,
+  Text,
+  HTMLNode,
+  Comment,
+}
+
+// export type DOMNode = { effects?: SyncJS<void>[] } & (
+export type DOMNode =
+  | {
+      kind: DOMNodeKind.Tag;
+      node: {
+        tag: string;
+        attributes: Record<string, string | number | boolean>;
+        children: DOMNode[];
+      };
+      refs?: SyncRef<Element>[];
+    }
+  | {
+      kind: DOMNodeKind.Text;
+      node: {
+        text: string;
+      };
+      refs?: SyncRef<Text>[];
+    }
+  | {
+      kind: DOMNodeKind.HTMLNode;
+      node: {
+        html: string;
+      };
+      refs?: SyncRef<Node>[];
+    }
+  | {
+      kind: DOMNodeKind.Comment;
+      node: string;
+      refs?: SyncRef<Comment>[];
+    };
 
 export type JSONLiteral = string | number | boolean | null;
 
-interface JSONRecord {
+export interface JSONRecord {
   [member: string]: JSONLiteral | JSONArray | JSONRecord;
 }
-interface JSONArray
+export interface JSONArray
   extends ReadonlyArray<JSONLiteral | JSONArray | JSONRecord> {}
 
 export type JSONable = JSONLiteral | JSONRecord | JSONArray;

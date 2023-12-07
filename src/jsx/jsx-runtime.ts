@@ -1,11 +1,14 @@
 import { Hydration, HydrationResource } from "../lifecycle.ts";
-import { isJS, isResource, js, frozen } from "../partial.ts";
+import { isResource, isReactive, fn, js, evalJS, sync } from "../partial.ts";
 import {
   ChildrenProp,
   contextSymbol,
+  DOMNodeKind,
+  DOMNode,
   ElementKind,
   ElementProps,
   JSONable,
+  SubStore,
 } from "./jsx.types.ts";
 
 const id = <T>(v: T) => v;
@@ -34,8 +37,10 @@ const escapeEscapes = (value: string) =>
 
 const escapeTag = (tag: string) => tag.replaceAll(/[<>"'&]/g, "");
 
+const zeroWidthSpaceHTML = "&#8203;";
+
 const escapeTextNode = (text: string) =>
-  escapeEscapes(text).replaceAll("<", "&lt;") || " "; // Empty would not be parsed as a text node
+  escapeEscapes(text).replaceAll("<", "&lt;") || zeroWidthSpaceHTML; // Empty would not be parsed as a text node
 
 const commentEscapeRegExp = /--(#|>)/g;
 
@@ -45,9 +50,12 @@ const escapeComment = (comment: string) =>
 export const escapeScriptContent = (node: JSX.DOMLiteral) =>
   String(node).replaceAll("</script", "</scr\\ipt");
 
-export const renderToString = async (root: JSX.Element) => {
+export const renderToString = async (root: JSX.Element) =>
+  DOMTreeToString(await toDOMTree(root));
+
+export const DOMTreeToString = (tree: DOMNode[]) => {
   const acc: string[] = [];
-  writeDOMTree(await toDOMTree(root), (chunk) => acc.push(chunk));
+  writeDOMTree(tree, (chunk) => acc.push(chunk));
   return acc.join("");
 };
 
@@ -115,7 +123,7 @@ export const deepHydration = (
 ): [Hydration, HydrationResource[]] => {
   const hydrationStore: Record<string, [number, JSONable]> = {};
   let storeIndex = 0;
-  const store = ({ uri, value }: JSX.Resource<JSONable>) => {
+  const store = ({ uri }: JSX.Resource<JSONable>, value: JSONable) => {
     hydrationStore[uri] ??= [storeIndex++, value];
     return hydrationStore[uri][0];
   };
@@ -127,16 +135,20 @@ export const deepHydration = (
 
 const domHydration = (
   dom: DOMNode[],
-  store: (resource: JSX.Resource<JSONable>) => number,
+  store: (resource: JSX.Resource<JSONable>, value: JSONable) => number,
 ) => {
   const hydration: Hydration = [];
 
   for (let i = 0; i < dom.length; i++) {
-    const { kind, node, effects } = dom[i];
-    if (effects) {
-      for (const effect of effects) {
-        hydration.push([i, effect.rawJS, effect.resources.map(store)]);
-      }
+    const { kind, node, refs = [] } = dom[i];
+    for (const ref of refs) {
+      hydration.push([
+        i,
+        ref.fn.body.rawJS,
+        ref.fn.body.expression ? 1 : 0,
+        ...(ref.fn.body.resources?.map((r, i) => store(r, ref.values[i])) ??
+          []),
+      ]);
     }
     if (kind === DOMNodeKind.Tag) {
       hydration.push([i, domHydration(node.children, store)]);
@@ -209,6 +221,11 @@ export const writeDOMTree = (
         write(escapeTextNode(node.text));
         break;
       }
+
+      case DOMNodeKind.HTMLNode: {
+        write(node.html);
+        break;
+      }
     }
   }
 };
@@ -243,19 +260,23 @@ const nodeToDOMTree = async (
     }
 
     case ElementKind.Intrinsic: {
-      const { tag, props, children } = syncRoot.element;
+      const {
+        tag,
+        props: { ref, ...props },
+        children,
+      } = syncRoot.element;
 
       const attributes: Record<string, string | number | boolean> = {};
       const reactiveAttributes: [
         string,
-        JSX.JSOrResource<string | number | boolean | null | undefined>,
+        JSX.ReactiveJSExpression<string | number | boolean | null>,
       ][] = [];
 
       const propEntries = Object.entries(props);
       let entry;
       while ((entry = propEntries.shift())) {
         const [name, value] = entry;
-        (function recordAttr(
+        await (async function recordAttr(
           name: string,
           value:
             | string
@@ -263,15 +284,15 @@ const nodeToDOMTree = async (
             | boolean
             | null
             | undefined
-            | JSX.JSOrResource<string | number | boolean | null | undefined>,
+            | JSX.ReactiveJSExpression<string | number | boolean | null>,
         ) {
           if (value != null) {
-            if (isJS(value)) {
-              recordAttr(name, value.eval());
+            if (isReactive<string | number | boolean | null>(value)) {
+              await recordAttr(name, await evalJS(value));
               reactiveAttributes.push([name, value]);
-            } else if (isResource(value)) {
-              recordAttr(name, value.value);
-              reactiveAttributes.push([name, value]);
+              // } else if (isResource(value)) {
+              //   await recordAttr(name, await value.value);
+              //   reactiveAttributes.push([name, value]);
             } else {
               attributes[name] = value;
             }
@@ -288,12 +309,19 @@ const nodeToDOMTree = async (
             children: await nodeToDOMTree(children, ctxData),
             // hydration,
           },
-          effects: reactiveAttributes.map(
-            ([name, jsValue]) =>
-              js`sub(_=>{let k=${frozen(
-                name,
-              )},v=${jsValue};!v&&v!=""?node.removeAttribute(k):node.setAttribute(k,v===!0?"":String(v))})`,
-          ),
+          refs: [
+            ...(await Promise.all(
+              reactiveAttributes.map(([name, reactive]) =>
+                sync(
+                  fn<[Element, SubStore], () => void>(
+                    (node, sub) =>
+                      js`${sub}(_=>let k=${name},v=${reactive};!v&&v!==""?${node}.removeAttribute(k):${node}.setAttribute(k,v===true?"":String(v)))`,
+                  ),
+                ),
+              ),
+            )),
+            ...(ref ? [await sync(ref as unknown as JSX.Ref<Element>)] : []),
+          ],
         },
       ];
     }
@@ -303,52 +331,69 @@ const nodeToDOMTree = async (
         {
           kind: DOMNodeKind.Text,
           node: {
-            text: String(
-              isResource(syncRoot.element)
-                ? syncRoot.element.value
-                : syncRoot.element.eval(),
-            ),
+            text: String(await evalJS(syncRoot.element)),
           },
-          effects: [js`sub(_=>node.textContent=${syncRoot.element})`],
+          refs: [
+            await sync(
+              fn<[Text, SubStore], () => void>(
+                (node, sub) =>
+                  js`${sub}(_=>${node}.textContent=${syncRoot.element})`,
+              ),
+            ),
+          ],
         },
       ];
     }
 
     case ElementKind.Text: {
       return [
-        { kind: DOMNodeKind.Text, node: { text: String(syncRoot.element) } },
+        {
+          kind: DOMNodeKind.Text,
+          node: { text: String(syncRoot.element.text) },
+          refs: syncRoot.element.ref
+            ? [
+                await sync(
+                  fn<[Text, SubStore]>(
+                    (node, sub) => js`${syncRoot.element.ref!(node, sub)}`,
+                  ),
+                ),
+              ]
+            : [],
+        },
       ];
     }
 
-    case ElementKind.DOM: {
-      return [syncRoot.element];
+    case ElementKind.HTMLNode: {
+      return [
+        {
+          kind: DOMNodeKind.HTMLNode,
+          node: { html: syncRoot.element.html },
+          refs: syncRoot.element.ref
+            ? [
+                await sync(
+                  fn<[Node, SubStore]>(
+                    (node, sub) => js`${syncRoot.element.ref!(node, sub)}`,
+                  ),
+                ),
+              ]
+            : [],
+        },
+      ];
     }
   }
 
   throw Error(`Can't handle JSX node ${syncRoot}`);
 };
 
-export enum DOMNodeKind {
-  Tag,
-  Text,
-  Comment,
-}
+export const htmlNode = (html: string, ref?: JSX.Ref<Node>): JSX.Element => ({
+  kind: ElementKind.HTMLNode,
+  element: { html, ref },
+});
 
-export type DOMNode = { effects?: JSX.JS<void>[] } & (
-  | { kind: DOMNodeKind.Tag; node: DOMNodeTag }
-  | { kind: DOMNodeKind.Text; node: DOMNodeText }
-  | { kind: DOMNodeKind.Comment; node: string }
-);
-
-export type DOMNodeTag = {
-  tag: string;
-  attributes: Record<string, string | number | boolean>;
-  children: DOMNode[];
-};
-
-type DOMNodeText = {
-  text: string;
-};
+export const text = (text: string, ref?: JSX.Ref<Text>): JSX.Element => ({
+  kind: ElementKind.Text,
+  element: { text, ref },
+});
 
 type CreateElement = {
   <Tag extends JSX.IntrinsicTag>(
@@ -412,11 +457,16 @@ const flatten = (children: JSX.Children): JSX.Fragment => {
       fragment.push(...flatten(child));
     } else if (child != null) {
       fragment.push(
-        isJS<JSX.DOMLiteral>(child) || isResource<JSX.DOMLiteral>(child)
+        isResource<JSX.DOMLiteral>(child)
+          ? { kind: ElementKind.JS, element: js`${child}` }
+          : isReactive<JSX.DOMLiteral>(child)
           ? { kind: ElementKind.JS, element: child }
           : typeof child === "object"
           ? (child as JSX.Element)
-          : { kind: ElementKind.Text, element: child as string | number },
+          : {
+              kind: ElementKind.Text,
+              element: { text: child as string | number },
+            },
       );
     }
   }
@@ -425,247 +475,3 @@ const flatten = (children: JSX.Children): JSX.Fragment => {
 };
 
 export { Fragment, jsx, jsx as jsxDev, jsx as jsxs };
-
-// const conditionMatchedContext = createContext<boolean>();
-
-// const render = async (
-//   root: JSX.Element,
-//   write: (chunk: string) => void,
-//   opts: { handleHydration?(hydration: Hydration): void } = {},
-// ) => {
-//   const hydrationStore: Record<string, [number, JSONable]> = {};
-//   let storeIndex = 0;
-//   const hydrationResIndex = ([uri, value]: JSX.Resource<JSONable>) => {
-//     hydrationStore[uri] ??= [storeIndex++, value];
-//     return hydrationStore[uri][0];
-//   };
-
-//   const hydrationStack: [Hydration, number][] = [[[], 0]];
-//   let wroteHydration = false;
-//   const writeHydration = () => {
-//     const [[hydration]] = hydrationStack;
-//     if (!wroteHydration) {
-//       if (opts.handleHydration) {
-//         opts.handleHydration(hydration);
-//       } else if (hydration.length) {
-//         write(
-//           `<script>hydrate(${escapeScriptContent(
-//             JSON.stringify(hydration),
-//           )})</script>`,
-//         );
-//       }
-//       wroteHydration = true;
-//     }
-//   };
-
-//   const writeAttr = (name: string, value?: JSX.DOMLiteral | boolean | null) => {
-//     write(" ");
-//     write(escapeTag(name));
-
-//     if (value === true) {
-//       write('=""');
-//     } else if (value) {
-//       write("=");
-//       const escapedValue = escapeEscapes(String(value)).replaceAll(
-//         "'",
-//         "&#39;",
-//       );
-//       if (/[\s>"]/.test(escapedValue)) {
-//         write("'");
-//         write(escapedValue);
-//         write("'");
-//       } else {
-//         write(escapedValue);
-//       }
-//     }
-//   };
-
-//   const renderChild = async (
-//     {
-//       tag: tagParam,
-//       Component,
-//       props,
-//       children,
-//       node,
-//       comment,
-//     }: JSX.SyncElement,
-//     parentContext: ContextData,
-//   ) => {
-//     const parentCtx = contextAPI(parentContext);
-//     let writeCurrent = () => {};
-
-//     const nodeHydrations: HydrationInfo[] = [];
-
-//     if (Component) {
-//       const contextData = [If, ElseIf, Else].includes(Component)
-//         ? parentContext
-//         : subContext(parentContext);
-//       writeCurrent = await renderChild(
-//         await Component(props, contextAPI(contextData)),
-//         contextData,
-//       );
-//     } else if (node) {
-//       const nodeValue = isJS<JSX.DOMLiteral>(node)
-//         ? node.value
-//         : (node as JSX.DOMNode | JSX.SyncElement);
-
-//       writeCurrent = await (isJSXElement(nodeValue)
-//         ? // Inline nodes => current context
-//           renderChild(nodeValue, parentContext)
-//         : () => {
-//             const text = parentCtx.getOrNull(scriptContext)
-//               ? escapeScriptContent(nodeValue)
-//               : escapeTextNode(nodeValue);
-
-//             if (isJS(node) || text) {
-//               write(text || " "); // Empty would not be parsed as a text node
-//               hydrationStack[0][1]++;
-
-//               if (isJS(node)) {
-//                 nodeHydrations.push([
-//                   HydrationType.Text,
-//                   node.rawJS,
-//                   node.resources.map(hydrationResIndex),
-//                 ]);
-//               }
-//             }
-//           });
-//     } else if (children) {
-//       const contextData = subContext(parentContext);
-
-//       // Parallelize calculations, but write sequentially
-//       const childrenWrites = await Promise.all(
-//         children.map((child) =>
-//           renderChild(
-//             child,
-//             tagParam === "script"
-//               ? subContext(parentContext, [
-//                   [scriptContext[contextSymbol], true],
-//                 ])
-//               : contextData,
-//           ),
-//         ),
-//       );
-//       writeCurrent = () => {
-//         for (const writeChild of childrenWrites) writeChild();
-//       };
-//     } else if (comment != null) {
-//       writeCurrent = () => {
-//         write(`<!--`);
-//         write(escapeComment(comment));
-//         write(`-->`);
-//       };
-//     }
-
-//     if (tagParam) {
-//       const tag = escapeTag(tagParam);
-
-//       switch (tag) {
-//         case "js-if":
-//           if (isJS(props.test)) {
-//             parentCtx.set(conditionMatchedContext, !!props.test.value);
-//             if (props.test.value) return writeCurrent;
-//             else return () => {};
-//           }
-//           break;
-//         case "js-elseif":
-//           if (parentCtx.has(conditionMatchedContext) && isJS(props.test)) {
-//             if (
-//               !parentCtx.getOrNull(conditionMatchedContext) &&
-//               props.test.value
-//             ) {
-//               parentCtx.set(conditionMatchedContext, true);
-//               return writeCurrent;
-//             } else return () => {};
-//           }
-//           break;
-//         case "js-else":
-//           if (parentCtx.has(conditionMatchedContext)) {
-//             if (!parentCtx.getOrNull(conditionMatchedContext)) {
-//               parentCtx.set(conditionMatchedContext, true);
-//               return writeCurrent;
-//             } else return () => {};
-//           }
-//           break;
-//         default:
-//           parentCtx.delete(conditionMatchedContext);
-//       }
-
-//       const attrWrites: (() => void)[] = [];
-//       const propEntries = Object.entries(props);
-//       let entry;
-//       while ((entry = propEntries.shift())) {
-//         const [name, value] = entry;
-
-//         if (value != null) {
-//           switch (typeof value) {
-//             case "boolean":
-//               if (value) attrWrites.push(() => writeAttr(name));
-//               break;
-//             case "number":
-//               attrWrites.push(() => writeAttr(name, String(value)));
-//               break;
-//             case "string":
-//               attrWrites.push(() => writeAttr(name, value));
-//               break;
-//             default: {
-//               attrWrites.push(() => {
-//                 writeAttr(name, value.value);
-//                 nodeHydrations.push([
-//                   HydrationType.Attr,
-//                   value.rawJS,
-//                   value.resources.map(hydrationResIndex),
-//                   name,
-//                 ]);
-//               });
-//               // for (const customEntry of renderAttribute(name, value)) {
-//               //   const [customName, customValue] = customEntry;
-//               //   attrWrites.push(() => writeAttr(customName, customValue));
-//               // }
-//             }
-//           }
-//         }
-//       }
-
-//       const writeChildren = writeCurrent;
-//       writeCurrent = () => {
-//         const hydrationCtx = hydrationStack[0];
-//         const [hydration, nodeIndex] = hydrationCtx;
-//         write("<");
-//         write(tag);
-
-//         for (const attrWrite of attrWrites) {
-//           attrWrite();
-//         }
-
-//         write(">");
-
-//         if (!(tag in voidElements)) {
-//           hydrationStack.unshift([[], 0]);
-
-//           writeChildren();
-
-//           const [childrenHydration, childrenLength] = hydrationStack.shift()!;
-//           if (childrenLength > 0) {
-//             hydration.push([
-//               nodeIndex,
-//               [HydrationType.Parent, childrenHydration],
-//             ]);
-//           }
-//           hydrationCtx[1]++;
-
-//           if (tag === "body") writeHydration();
-
-//           write("</");
-//           write(tag);
-//           write(">");
-//         }
-//       };
-//     }
-
-//     return writeCurrent;
-//   };
-
-//   (await renderChild(await root, subContext()))();
-//   writeHydration();
-// };

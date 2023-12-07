@@ -658,7 +658,8 @@ export type Rewrap<T extends object> = T extends infer OBJ
   : never;
 
 type HTMLProps<T extends object = never> = HTMLVoidProps<T> &
-  Partial<Record<"children", JSX.Children>>;
+  Partial<Record<"children", JSX.Children>> &
+  Partial<Record<"ref", JSX.Ref<Element>>>;
 
 type HTMLVoidProps<T extends object = never> = Rewrap<
   ExtendBaseProps<
